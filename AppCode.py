@@ -563,12 +563,8 @@ if module == "Module 1":
             "Observe **R² / RMSE** and how the outline converges to the original shape."
         )
 
-    show_images(
-        ["module1_1.png", "module1_2.png"],
-        "📌 Module 1 instructions (figure)",
-        expanded=EXPANDED,
-        ncols=1
-    )
+    show_images(["Module1_1.png", "Module1_2.png"], "📌 Module 1 instructions (figure)", expanded=EXPANDED, ncols=1)
+
 
     display_ids = [id_map[o] for o in original_ids]
     chosen_display = st.selectbox("Choose particle", display_ids, index=0)
