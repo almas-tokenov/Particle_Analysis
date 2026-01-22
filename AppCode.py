@@ -1,43 +1,37 @@
-# Shape Analysis Streamlit App (single file, v4)
-# -------------------------------------------------
-# Features:
-# 1) Single particle: outline reconstruction vs harmonics + ellipse (N=1) + equal-area circle
-# 2) Sensitivity: Assymetry & Polygonality vs harmonics (2..20 by default), clear boxplots
-# 3) Whole sample: batch analysis + downloads + analytics (filters, outliers, scatter, histogram, correlation)
-#
+# Shape Analysis Streamlit App (single file) — Modules version
+# (NO computation parameters sidebar) + px/mm + fixed Module 2 + better R² + compact figures
+# ---------------------------------------------------------------------------------------------------------
 # Install:
 #   pip install streamlit numpy pandas scipy plotly pillow matplotlib
-# Optional (Page 1):
+# Optional (Module 1 reconstruction):
 #   pip install spatial_efd
 #
 # Run:
-#   python -m streamlit run ShapeAnalysis_Streamlit_App_v4_singlefile.py
+#   python -m streamlit run app.py
 
 from __future__ import annotations
 
-import base64
+import hashlib
 import io
-import time
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import plotly.express as px
-
+import streamlit as st
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-from pathlib import Path
 
-# Optional (Page 1)
+# Optional: spatial_efd (Module 1)
 try:
-    import spatial_efd.spatial_efd as spatial_efd
+    import spatial_efd
     SPATIAL_EFD_AVAILABLE = True
 except Exception:
     SPATIAL_EFD_AVAILABLE = False
 
-# Required (core math)
+# Optional: SciPy special (ellipse perimeter). Fallback to Ramanujan if unavailable.
 try:
     from scipy.special import elliprd, elliprf
     SCIPY_SPECIAL_AVAILABLE = True
@@ -46,544 +40,311 @@ except Exception:
 
 
 # =============================================================================
-# Embedded instruction images (A–F) — labeled & upscaled
+# Paths + instruction images (no absolute paths required)
 # =============================================================================
+APP_DIR = Path(__file__).resolve().parent
+ASSETS_DIRS = [
+    APP_DIR / "assets",
+    APP_DIR / "Instruction images",
+    APP_DIR,
+]
 
 
-# =============================================================================
-# Instruction figures
-# =============================================================================
-# To keep this file readable, instruction images are NOT embedded as base64.
-# If you want figures in the app, place PNG files next to this script in:
-#   ./assets/instruction_A.png ... instruction_F.png
-#
-# (This keeps the code clean and still supports high-quality figures.)
-ASSETS_DIR = Path(__file__).parent / "assets"
-INSTRUCTION_LABELS = ["A", "B", "C", "D", "E", "F"]
-
-def render_instruction_figures():
-    """Compact 3×2 grid inside an expander (loads from ./assets if present)."""
-    existing = []
-    for lab in INSTRUCTION_LABELS:
-        p = ASSETS_DIR / f"instruction_{lab}.png"
+def _resolve_image(path_or_name: str) -> Optional[Path]:
+    """Resolve an image by absolute path or by filename in ./assets or ./Instruction images."""
+    try:
+        p = Path(path_or_name)
         if p.exists():
-            existing.append((lab, p))
-    if not existing:
-        st.caption("Instruction figures: add files to ./assets (instruction_A.png ... instruction_F.png) to display them.")
+            return p
+    except Exception:
+        pass
+
+    name = Path(str(path_or_name)).name
+    for base in ASSETS_DIRS:
+        cand = base / name
+        if cand.exists():
+            return cand
+    return None
+
+
+def show_images(paths: List[str], title: str, expanded: bool, ncols: int = 2) -> None:
+    """Compact image grid inside one expander. Ignores missing images."""
+    resolved = []
+    for s in paths:
+        p = _resolve_image(s)
+        if p is not None:
+            resolved.append(p)
+    if not resolved:
         return
-    with st.expander("📌 Instruction figures (click to expand)", expanded=False):
-        cols = st.columns(3)
-        for i, (lab, p) in enumerate(existing):
-            with cols[i % 3]:
+
+    with st.expander(title, expanded=expanded):
+        cols = st.columns(ncols)
+        for i, p in enumerate(resolved):
+            with cols[i % ncols]:
                 st.image(str(p), use_container_width=True)
 
 
 # =============================================================================
-# Robust CSV loader + ID mapping
+# CSV loader
 # =============================================================================
 def load_xy_csv(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Robust loader: supports comma/semicolon/tab separators and column-name variants.
-    Output columns: ID, X, Y
-    """
+    """Robust loader for ID, X, Y (handles , ; tab)."""
     df = None
     for sep in [",", ";", "\t", None]:
         try:
             df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, engine="python")
-            if df.shape[1] >= 3:
+            if df is not None and df.shape[1] >= 3:
                 break
         except Exception:
             df = None
 
     if df is None or df.empty:
-        raise ValueError("Could not read CSV. Check delimiter/encoding. Expected columns: ID, X, Y.")
+        raise ValueError("Could not read CSV. Expected columns: ID, X, Y.")
 
-    # normalize column names
     df = df.rename(columns={c: str(c).strip() for c in df.columns})
     lower_map = {c.lower().strip(): c for c in df.columns}
 
-    def pick(opts: List[str]) -> str | None:
+    def pick(opts: List[str]) -> Optional[str]:
         for o in opts:
             if o in lower_map:
                 return lower_map[o]
         return None
 
-    id_col = pick(["id", "particle_id", "particle", "pid"])
-    x_col = pick(["x", "xcoord", "x_coordinate"])
-    y_col = pick(["y", "ycoord", "y_coordinate"])
+    id_col = pick(["id", "particle", "particle_id", "pid", "label"])
+    x_col = pick(["x", "xcoord", "x_coord", "x-coordinate"])
+    y_col = pick(["y", "ycoord", "y_coord", "y-coordinate"])
 
-    # fallback: first 3 columns
     if id_col is None or x_col is None or y_col is None:
-        id_col, x_col, y_col = df.columns[:3]
+        cols = list(df.columns[:3])
+        id_col, x_col, y_col = cols[0], cols[1], cols[2]
 
     out = df[[id_col, x_col, y_col]].copy()
     out.columns = ["ID", "X", "Y"]
     out["ID"] = out["ID"].astype(str).str.strip()
     out["X"] = pd.to_numeric(out["X"], errors="coerce")
     out["Y"] = pd.to_numeric(out["Y"], errors="coerce")
-    out = out.dropna(subset=["ID", "X", "Y"])
+    out = out.dropna(subset=["ID", "X", "Y"]).reset_index(drop=True)
     return out
 
 
-def make_id_mapping(original_ids: List[str], mode: str) -> Dict[str, str]:
-    """
-    mode:
-      - "Sequential P001"
-      - "Original"
-    """
-    if mode == "Original":
-        return {oid: oid for oid in original_ids}
-    mapping = {}
-    for i, oid in enumerate(original_ids, start=1):
-        mapping[oid] = f"P{i:03d}"
-    return mapping
+def make_id_mapping(original_ids: List[str]) -> Dict[str, str]:
+    return {oid: f"P{i:03d}" for i, oid in enumerate(original_ids, start=1)}
 
 
 # =============================================================================
-# Optimized shape analysis engine (same logic as your optimized pipeline)
+# Units calibration (px/mm)
 # =============================================================================
-def ELLE(ak: float) -> float:
-    if not SCIPY_SPECIAL_AVAILABLE:
-        raise RuntimeError("SciPy (scipy.special.elliprf/elliprd) is required.")
-    ak = float(np.clip(ak, 0.0, 1.0))
-    s = 1.0
-    cc = 0.0
-    Q = (1.0 - s * ak) * (1.0 + s * ak)
-    return s * (elliprf(cc, Q, 1.0) - ((s * ak) * (s * ak)) * elliprd(cc, Q, 1.0) / 3.0)
+def px_to_mm(length_px: float, px_per_mm: float) -> float:
+    px_per_mm = float(max(px_per_mm, 1e-12))
+    return float(length_px) / px_per_mm
 
 
-def OutlineCentroid(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
-    return float(np.mean(x)), float(np.mean(y))
+def px2_to_mm2(area_px2: float, px_per_mm: float) -> float:
+    px_per_mm = float(max(px_per_mm, 1e-12))
+    return float(area_px2) / (px_per_mm ** 2)
 
 
-def OutlineArea(x: np.ndarray, y: np.ndarray) -> float:
+# =============================================================================
+# Geometry helpers
+# =============================================================================
+def _ensure_closed(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    return float(np.abs(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)) / 2.0)
+    if len(x) >= 3 and (x[0] != x[-1] or y[0] != y[-1]):
+        x = np.append(x, x[0])
+        y = np.append(y, y[0])
+    return x, y
 
 
 def OutlinePerimeter(x: np.ndarray, y: np.ndarray) -> float:
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    dx = np.roll(x, -1) - x
-    dy = np.roll(y, -1) - y
-    return float(np.sum(np.sqrt(dx * dx + dy * dy)))
+    if len(x) < 2:
+        return 0.0
+    dx = np.diff(x)
+    dy = np.diff(y)
+    return float(np.sum(np.hypot(dx, dy)))
 
 
+def OutlineArea(x: np.ndarray, y: np.ndarray) -> float:
+    x, y = _ensure_closed(x, y)
+    if len(x) < 4:
+        return 0.0
+    return float(0.5 * np.abs(np.dot(x[:-1], y[1:]) - np.dot(y[:-1], x[1:])))
+
+
+def OutlineCentroid(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    return float(np.mean(x)), float(np.mean(y))
+
+
+def ellipse_perimeter(a: float, b: float) -> float:
+    """Ellipse perimeter (Carlson via SciPy if available, else Ramanujan)."""
+    a = float(abs(a))
+    b = float(abs(b))
+    if a <= 0 or b <= 0:
+        return 0.0
+
+    if not SCIPY_SPECIAL_AVAILABLE:
+        h = ((a - b) ** 2) / ((a + b) ** 2 + 1e-12)
+        return float(math.pi * (a + b) * (1 + (3 * h) / (10 + math.sqrt(max(1e-12, 4 - 3 * h)))))
+
+    if b > a:
+        a, b = b, a
+    e2 = 1.0 - (b / a) ** 2
+    m = float(np.clip(e2, 0.0, 1.0))
+    RF = elliprf(0.0, 1.0 - m, 1.0)
+    RD = elliprd(0.0, 1.0 - m, 1.0)
+    E = RF - (m / 3.0) * RD
+    return float(4.0 * a * E)
+
+
+def equal_area_circle_radius(x: np.ndarray, y: np.ndarray) -> float:
+    area = OutlineArea(x, y)
+    return float(math.sqrt(area / math.pi)) if area > 0 else 0.0
+
+
+def fit_ellipse_equal_area(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, float, float]:
+    """
+    Covariance-based ellipse orientation + scale to match polygon area.
+    Returns (cx, cy, a, b, theta) with a>=b.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    cx, cy = OutlineCentroid(x, y)
+    X = np.stack([x - cx, y - cy], axis=1)
+
+    cov = np.cov(X.T)
+    vals, vecs = np.linalg.eigh(cov)
+    order = np.argsort(vals)[::-1]
+    vals = vals[order]
+    vecs = vecs[:, order]
+
+    area = OutlineArea(x, y)
+    if area <= 0:
+        area = float(np.pi * max(vals[0], 1e-12) * max(vals[1], 1e-12))
+
+    a0 = math.sqrt(max(vals[0], 1e-12))
+    b0 = math.sqrt(max(vals[1], 1e-12))
+    scale = math.sqrt(area / (math.pi * a0 * b0 + 1e-12))
+
+    a = a0 * scale
+    b = b0 * scale
+    theta = math.atan2(vecs[1, 0], vecs[0, 0])
+
+    if b > a:
+        a, b = b, a
+        theta += math.pi / 2.0
+
+    return cx, cy, a, b, theta
+
+
+def ShapeFactors(area: float, perimeter: float) -> Tuple[float, float, float, float]:
+    """(Circularity, Sphericity, Bulkiness, Surface_roughness)."""
+    if area <= 0 or perimeter <= 0:
+        return (float("nan"),) * 4
+    circularity = float(4.0 * math.pi * area / (perimeter * perimeter + 1e-12))
+    sphericity = float(math.sqrt(max(circularity, 0.0)))
+    bulkiness = float((perimeter * perimeter) / (4.0 * math.pi * area + 1e-12))
+
+    r = math.sqrt(area / math.pi)
+    circ_p = 2.0 * math.pi * r
+    roughness = float(perimeter / (circ_p + 1e-12))
+    return circularity, sphericity, bulkiness, roughness
+
+
+# =============================================================================
+# Elliptic Fourier (simple)
+# =============================================================================
 def ComputeEllFourierCoef(x: np.ndarray, y: np.ndarray, n_harmonics: int):
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    n_pts = len(x)
+    x, y = _ensure_closed(x, y)
 
     Ax = np.zeros(n_harmonics + 1, dtype=np.float64)
     Bx = np.zeros(n_harmonics + 1, dtype=np.float64)
     Ay = np.zeros(n_harmonics + 1, dtype=np.float64)
     By = np.zeros(n_harmonics + 1, dtype=np.float64)
 
-    if n_pts < 2:
-        Ax[0] = x[0] if n_pts else 0.0
-        Ay[0] = y[0] if n_pts else 0.0
+    if len(x) < 4:
+        Ax[0] = x[0] if len(x) else 0.0
+        Ay[0] = y[0] if len(y) else 0.0
         return Ax, Bx, Ay, By
 
-    x_next = np.roll(x, -1)
-    y_next = np.roll(y, -1)
-    dx = x_next - x
-    dy = y_next - y
-    dt = np.sqrt(dx * dx + dy * dy)
+    dx = np.diff(x)
+    dy = np.diff(y)
+    dt = np.hypot(dx, dy)
+    dt[dt == 0] = 1e-12
+    t = np.concatenate(([0.0], np.cumsum(dt)))
+    T = float(t[-1]) if float(t[-1]) > 0 else 1.0
 
-    rx = np.where(dt != 0.0, dx / dt, 0.0)
-    ry = np.where(dt != 0.0, dy / dt, 0.0)
+    for n in range(1, n_harmonics + 1):
+        cn = 2.0 * math.pi * n / T
+        cos_ct = np.cos(cn * t)
+        sin_ct = np.sin(cn * t)
 
-    t_curr = np.cumsum(dt)
-    t_prev = np.concatenate(([0.0], t_curr[:-1]))
-    T = float(t_curr[-1]) if len(t_curr) else 0.0
+        Ax[n] = (1.0 / (cn * cn * T)) * np.sum((dx / dt) * (cos_ct[1:] - cos_ct[:-1]))
+        Bx[n] = (1.0 / (cn * cn * T)) * np.sum((dx / dt) * (sin_ct[1:] - sin_ct[:-1]))
+        Ay[n] = (1.0 / (cn * cn * T)) * np.sum((dy / dt) * (cos_ct[1:] - cos_ct[:-1]))
+        By[n] = (1.0 / (cn * cn * T)) * np.sum((dy / dt) * (sin_ct[1:] - sin_ct[:-1]))
 
-    # DC terms
-    Tsum = 0.0
-    Xsum = 0.0
-    Ysum = 0.0
-    Ax0_int = 0.0
-    Ay0_int = 0.0
-    for i in range(n_pts):
-        DT_i = float(dt[i])
-        Tnew = Tsum + DT_i
-        Rx_i = float(rx[i])
-        Ry_i = float(ry[i])
-
-        Xi_i = Xsum - Rx_i * Tsum
-        Delta_i = Ysum - Ry_i * Tsum
-
-        Ax0_int += 0.5 * Rx_i * (Tnew * Tnew - Tsum * Tsum) + Xi_i * DT_i
-        Ay0_int += 0.5 * Ry_i * (Tnew * Tnew - Tsum * Tsum) + Delta_i * DT_i
-
-        Tsum = Tnew
-        Xsum += float(dx[i])
-        Ysum += float(dy[i])
-
-    if T > 0.0:
-        Ax[0] = float(x[0] + Ax0_int / T)
-        Ay[0] = float(y[0] + Ay0_int / T)
-    else:
-        Ax[0] = float(x[0])
-        Ay[0] = float(y[0])
-
-    if n_harmonics == 0 or T == 0.0:
-        return Ax, Bx, Ay, By
-
-    j = np.arange(1, n_harmonics + 1, dtype=np.float64)
-    c1 = 2.0 * np.pi * j / T
-
-    theta_curr = np.outer(t_curr, c1)
-    theta_prev = np.outer(t_prev, c1)
-
-    diff_cos = np.cos(theta_curr) - np.cos(theta_prev)
-    diff_sin = np.sin(theta_curr) - np.sin(theta_prev)
-
-    AxSUM = rx @ diff_cos
-    BxSUM = rx @ diff_sin
-    AySUM = ry @ diff_cos
-    BySUM = ry @ diff_sin
-
-    c2 = T / (2.0 * (np.pi ** 2) * (j ** 2))
-    Ax[1:] = AxSUM * c2
-    Bx[1:] = BxSUM * c2
-    Ay[1:] = AySUM * c2
-    By[1:] = BySUM * c2
+    Ax[0] = float(np.mean(x))
+    Ay[0] = float(np.mean(y))
     return Ax, Bx, Ay, By
 
 
-def FourierCoefNormalization(Ax, Bx, Ay, By, flag_scale, flag_rotation, flag_start):
-    Ax = Ax.copy(); Bx = Bx.copy(); Ay = Ay.copy(); By = By.copy()
-    Ax0, Ay0 = Ax[0], Ay[0]
-    Ax1, Bx1, Ay1, By1 = Ax[1], Bx[1], Ay[1], By[1]
-
-    denom = Ax1 * Ax1 + Ay1 * Ay1 - Bx1 * Bx1 - By1 * By1
-    theta = 0.5 * np.arctan2(2.0 * (Ax1 * Bx1 + Ay1 * By1), denom)
-
-    Astar = Ax1 * np.cos(theta) + Bx1 * np.sin(theta)
-    Cstar = Ay1 * np.cos(theta) + By1 * np.sin(theta)
-    psi = np.arctan2(Cstar, Astar)
-
-    Estar = float(np.sqrt(Astar * Astar + Cstar * Cstar))
-    if Estar == 0.0:
-        Estar = 1.0
-    if flag_scale == 0:
-        Estar = 1.0
-    if flag_rotation == 0:
-        psi = 0.0
-    if flag_start == 0:
-        theta = 0.0
-
-    cos_psi = np.cos(psi)
-    sin_psi = np.sin(psi)
-
-    Ax0N = (cos_psi * Ax0 + sin_psi * Ay0) / Estar
-    Ay0N = (-sin_psi * Ax0 + cos_psi * Ay0) / Estar
-
-    n_harmonics = len(Ax) - 1
-    for i in range(1, n_harmonics + 1):
-        cos_t = np.cos(float(i) * theta)
-        sin_t = np.sin(float(i) * theta)
-
-        c1 = Ax[i] * cos_psi + Ay[i] * sin_psi
-        c2 = Bx[i] * cos_psi + By[i] * sin_psi
-        c3 = Ay[i] * cos_psi - Ax[i] * sin_psi
-        c4 = By[i] * cos_psi - Bx[i] * sin_psi
-
-        Ax[i] = (c1 * cos_t + c2 * sin_t) / Estar
-        Bx[i] = (c2 * cos_t - c1 * sin_t) / Estar
-        Ay[i] = (c3 * cos_t + c4 * sin_t) / Estar
-        By[i] = (c4 * cos_t - c3 * sin_t) / Estar
-
-    Ax[0] = Ax0N
-    Ay[0] = Ay0N
-    Bx[0] = 0.0
-    By[0] = 0.0
-    return Ax, Bx, Ay, By, Estar, float(psi), float(theta)
-
-
-def CoefNormalization(x, y, xmid, ymid, flag_location, flag_scale, flag_rotation, flag_start, n_harmonics):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    if flag_location == 1:
-        x0 = x - xmid
-        y0 = y - ymid
-    else:
-        x0 = x
-        y0 = y
-    Ax, Bx, Ay, By = ComputeEllFourierCoef(x0, y0, n_harmonics)
-    return FourierCoefNormalization(Ax, Bx, Ay, By, flag_scale, flag_rotation, flag_start)
-
-
-def ShapeIndex(Ax, Bx, Ay, By, flag_rotation, psi, xmid, ymid, scale1, x, y, n0_sum, large_number):
-    Bk1 = np.zeros(64, dtype=np.float64)
-    Ask = np.zeros(max(64, n0_sum + 1), dtype=np.float64)
-    Bsk = np.zeros(max(64, n0_sum + 1), dtype=np.float64)
-    Bk2 = np.zeros(n0_sum + 1, dtype=np.float64)
-
-    Ax1, Bx1, Ay1, By1 = Ax[1], Bx[1], Ay[1], By[1]
-    cos_psi = float(np.cos(psi))
-    sin_psi = float(np.sin(psi))
-
-    if flag_rotation == 0:
-        denom = Ax1**2 + Ay1**2 - Bx1**2 - By1**2
-        theta = 0.5 * np.arctan2(2.0 * (Ax1 * Bx1 + Ay1 * By1), denom)
-        Astar = Ax1 * np.cos(theta) + Bx1 * np.sin(theta)
-        Cstar = Ay1 * np.cos(theta) + By1 * np.sin(theta)
-        psi = float(np.arctan2(Cstar, Astar))
-        cos_psi = float(np.cos(psi))
-        sin_psi = float(np.sin(psi))
-
-        c1 = Ax1 * cos_psi + Ay1 * sin_psi
-        c2 = Bx1 * cos_psi + By1 * sin_psi
-        c3 = Ay1 * cos_psi - Ax1 * sin_psi
-        c4 = By1 * cos_psi - Bx1 * sin_psi
-        Ax1, Bx1, Ay1, By1 = c1, c2, c3, c4
-
-    det = float(np.abs(Bx1 * Ay1 - Ax1 * By1))
-    denom_ae = float(np.sqrt(Ay1**2 + By1**2))
-    denom_be = float(np.sqrt(Ax1**2 + Bx1**2))
-    ae = det / denom_ae if denom_ae != 0 else np.nan
-    be = det / denom_be if denom_be != 0 else np.nan
-    k = be / ae if (np.isfinite(ae) and ae != 0) else np.nan
-
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    n_pts = len(x)
-
-    if not np.isfinite(ae) or not np.isfinite(be) or ae <= 0 or be <= 0 or scale1 == 0:
-        return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan,
-                np.nan, np.nan, Bk1, Bk2, Ask[:64], Bsk[:64])
-
-    Xs = x - xmid
-    Ys = y - ymid
-    xp = (Xs * cos_psi + Ys * sin_psi) / scale1
-    yp = (-Xs * sin_psi + Ys * cos_psi) / scale1
-
-    rd = np.sqrt(xp * xp + yp * yp)
-    th = np.arctan2(yp, xp)
-
-    ae_sq = ae * ae
-    be_sq = be * be
-    cos_th_sq = np.cos(th) ** 2
-    re_denom = np.sqrt(np.maximum(ae_sq - (ae_sq - be_sq) * cos_th_sq, 0.0))
-    re = np.divide(ae * be, re_denom, out=np.full_like(re_denom, np.nan), where=re_denom != 0)
-
-    Sr = float(np.sum((rd - re) ** 2) / float(n_pts))
-
-    xk = 1.0 - (be_sq / ae_sq)
-    xk = float(np.clip(xk, 0.0, 1.0))
-    Le = float(4.0 * ae * ELLE(np.sqrt(xk)))
-    rc = float(Le / (2.0 * np.pi)) if Le != 0 else np.nan
-    Uc = float(np.sqrt(Sr) / rc) if (np.isfinite(rc) and rc != 0) else np.nan
-
-    # Sharpness (vectorized)
-    xp1 = np.roll(xp, -1); yp1 = np.roll(yp, -1)
-    dx = xp1 - xp; dy = yp1 - yp
-    di = np.full_like(dx, 1000.0, dtype=np.float64)
-    mask = np.abs(dx) > 1e-30
-    np.divide(dy, dx, out=di, where=mask)
-
-    jj = np.arange(36, dtype=np.float64)
-    theta_jj = (2.0 * np.pi / 36.0) * jj
-    cos_jj = np.cos(theta_jj); sin_jj = np.sin(theta_jj)
-
-    di2 = di[:, None]
-    numerator = di2 * cos_jj - sin_jj
-    denominator = cos_jj + di2 * sin_jj
-    ratio = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator != 0)
-    aver_sum = np.sum(ratio, axis=1)
-    aver = np.arctan(aver_sum / 36.0)
-
-    # S1
-    j1 = np.arange(1, 65, dtype=np.float64)
-    i1 = np.arange(1, n_pts + 1, dtype=np.float64)
-    arg1 = (2.0 * np.pi / n_pts) * i1[:, None] * j1[None, :]
-    say_vec = np.sum(aver[:, None] * np.cos(arg1), axis=0) / float(n_pts)
-    sby_vec = np.sum(aver[:, None] * np.sin(arg1), axis=0) / float(n_pts)
-    sint1 = np.sqrt(say_vec * say_vec + sby_vec * sby_vec)
-    SUM_Bk1 = float(np.sum(sint1))
-    S1 = float(1.0 / SUM_Bk1) if SUM_Bk1 != 0 else np.nan
-    Bk1[:] = sint1
-    Ask[:64] = say_vec
-    Bsk[:64] = sby_vec
-
-    # S2
-    j2 = np.arange(1, n0_sum + 1, dtype=np.float64)
-    arg2 = (2.0 * np.pi / n_pts) * i1[:, None] * j2[None, :]
-    say2 = np.sum(aver[:, None] * np.cos(arg2), axis=0) / float(n_pts)
-    sby2 = np.sum(aver[:, None] * np.sin(arg2), axis=0) / float(n_pts)
-
-    say1 = float(say2[0]) if len(say2) else np.nan
-    sby1 = float(sby2[0]) if len(sby2) else np.nan
-
-    SUM_Bk2 = float(np.sqrt(2.0))
-    Bk2[1] = float(np.sqrt(2.0))
-    if n0_sum >= 2 and np.isfinite(say1) and np.isfinite(sby1) and say1 != 0 and sby1 != 0:
-        sint2 = np.sqrt((say2[1:] / say1) ** 2 + (sby2[1:] / sby1) ** 2)
-        sint2 = np.where(sint2 > large_number, 0.0, sint2)
-        SUM_Bk2 += float(np.sum(sint2))
-        Bk2[2:n0_sum + 1] = sint2
-    S2 = float(1.0 / SUM_Bk2) if SUM_Bk2 != 0 else np.nan
-
-    Ask[1:n0_sum + 1] = say2
-    Bsk[1:n0_sum + 1] = sby2
-    return ae, be, k, Le, rc, Uc, S1, S2, Bk1, Bk2, Ask[:max(64, n0_sum + 1)], Bsk[:max(64, n0_sum + 1)]
-
-
-def ShapeIndicesEF(Ax, Bx, Ay, By, no_sum, large_limit, small_limit,
-                   xmid, ymid, flag_scale, scale1, psi, start_angle,
-                   x, y, n_harmonics, flag_rotation):
-    ae, be, k, Le, rc, Uc, S1, S2, Bk1, Bk2, Ask, Bsk = ShapeIndex(
-        Ax, Bx, Ay, By,
-        flag_rotation=flag_rotation,
-        psi=psi,
-        xmid=xmid, ymid=ymid,
-        scale1=1.0 if flag_scale == 0 else scale1,
-        x=x, y=y, n0_sum=no_sum,
-        large_number=large_limit
-    )
-
-    Ax2, Bx2, Ay2, By2 = ComputeEllFourierCoef(x, y, n_harmonics)
-
-    no_ass = min(n_harmonics, no_sum)
-    Ax_s = Ax2[1:no_ass + 1]; Bx_s = Bx2[1:no_ass + 1]
-    Ay_s = Ay2[1:no_ass + 1]; By_s = By2[1:no_ass + 1]
-
-    abs_Ax = np.abs(Ax_s); abs_Bx = np.abs(Bx_s)
-    abs_Ay = np.abs(Ay_s); abs_By = np.abs(By_s)
-
-    cond_bx = (abs_Bx > small_limit) & (abs_Ax > small_limit)
-    cond_ay = (abs_Ay > small_limit) & (abs_By > small_limit)
-
-    ratio_bx = np.divide(abs_Bx, abs_Ax, out=np.zeros_like(abs_Bx), where=cond_bx)
-    ratio_ay = np.divide(abs_Ay, abs_By, out=np.zeros_like(abs_Ay), where=cond_ay)
-
-    SumBx = float(np.sum(ratio_bx))
-    SumAy = float(np.sum(ratio_ay))
-    Ass2 = float(np.sqrt(SumBx * SumAy)) if (SumBx >= 0 and SumAy >= 0) else np.nan
-
-    no_ass1 = min(15, n_harmonics)
-    Ax_s1 = Ax2[2:no_ass1 + 1]
-    Ay_s1 = Ay2[2:no_ass1 + 1]
-    Bx_s1 = Bx2[2:no_ass1 + 1]
-    By_s1 = By2[2:no_ass1 + 1]
-
-    SumAx = float(np.sum(np.where(np.abs(Ax_s1) > small_limit, np.abs(Ax_s1), 0.0)))
-    SumAy = float(np.sum(np.where(np.abs(Ay_s1) > small_limit, np.abs(Ay_s1), 0.0)))
-    SumBx = float(np.sum(np.where(np.abs(Bx_s1) > small_limit, np.abs(Bx_s1), 0.0)))
-    SumBy = float(np.sum(np.where(np.abs(By_s1) > small_limit, np.abs(By_s1), 0.0)))
-
-    Ass1 = 0.0
-    if SumAx > 0.0 and SumBy > 0.0:
-        Ass1 = float(np.sqrt((SumBx / SumAx) * (SumAy / SumBy)))
-
-    # Polygonality
-    j = 1
-    MaxAx = float(np.abs(Ax2[2])) if len(Ax2) > 2 else 0.0
-    NoMaxAx1 = 2
-    MaxBy = float(np.abs(By2[2])) if len(By2) > 2 else 0.0
-    NoMaxBy1 = 2
-    while j <= n_harmonics:
-        if MaxAx < float(np.abs(Ax2[j])):
-            MaxAx = float(np.abs(Ax2[j])); NoMaxAx1 = j
-        if MaxBy < float(np.abs(By2[j])):
-            MaxBy = float(np.abs(By2[j])); NoMaxBy1 = j
-        j += 1
-
-    j = 1
-    MaxAx = float(np.abs(Ax2[2])) if len(Ax2) > 2 else 0.0
-    NoMaxAx = 2
-    MaxBy = float(np.abs(By2[2])) if len(By2) > 2 else 0.0
-    NoMaxBy = 2
-    while j <= n_harmonics:
-        if j != NoMaxAx1 and MaxAx < float(np.abs(Ax2[j])):
-            MaxAx = float(np.abs(Ax2[j])); NoMaxAx = j
-        if j != NoMaxBy1 and MaxBy < float(np.abs(By2[j])):
-            MaxBy = float(np.abs(By2[j])); NoMaxBy = j
-        j += 1
-
-    Px = NoMaxAx + 1
-    Py = NoMaxBy + 1
-    P = float(np.sqrt(Px * Py))
-    return ae, be, k, Le, rc, Uc, S1, S2, Bk1, Bk2, Ask, Bsk, Ass1, Ass2, P
-
-
-def ComputeAngularity(Ax, Bx, Ay, By, n_harmonics: int, w: int = 360) -> float:
-    TwoPi = 2.0 * np.pi
-    angles = np.linspace(0.0, TwoPi, w, endpoint=False)
-
-    n = np.arange(1, n_harmonics + 1, dtype=np.float64)
-    n_u = np.outer(angles, n)
-
-    sin_nu = np.sin(n_u)
-    cos_nu = np.cos(n_u)
-
-    nAx = n * Ax[1:n_harmonics + 1]
-    nBx = n * Bx[1:n_harmonics + 1]
-    nAy = n * Ay[1:n_harmonics + 1]
-    nBy = n * By[1:n_harmonics + 1]
-
-    x_deriv = np.sum((-nAx) * sin_nu + (nBx) * cos_nu, axis=1)
-    y_deriv = np.sum((-nAy) * sin_nu + (nBy) * cos_nu, axis=1)
-
-    hx = np.unwrap(np.arctan2(y_deriv, x_deriv))
-    dh = np.abs(np.diff(hx, append=hx[0]))
-    return float((1.0 / TwoPi) * np.sum(dh) - 1.0)
-
-
-def ShapeFactors(x, y, area=None, perimeter=None):
-    Pi = np.pi
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    if area is None:
-        area = OutlineArea(x, y)
-    if perimeter is None:
-        perimeter = OutlinePerimeter(x, y)
-
-    if area <= 0 or perimeter <= 0 or not np.isfinite(area) or not np.isfinite(perimeter):
-        return (np.nan, np.nan, np.nan, np.nan, np.nan)
-
-    Xm, Ym = float(np.mean(x)), float(np.mean(y))
-
-    N_angle = 180
-    delta_psi = Pi / (N_angle - 1)
-    psi = 0.0
-    HeightMin = 1e10
-    LengthMax = np.nan
-
-    for _ in range(N_angle):
-        c = np.cos(psi); s = np.sin(psi)
-        Xwork = (x - Xm) * c + (y - Ym) * s
-        Ywork = -(x - Xm) * s + (y - Ym) * c
-
-        Xmin, Xmax = np.min(Xwork), np.max(Xwork)
-        Ymin, Ymax = np.min(Ywork), np.max(Ywork)
-
-        LengthCurrent = abs(Xmin) + abs(Xmax)
-        HeightCurrent = abs(Ymin) + abs(Ymax)
-
-        if HeightCurrent < HeightMin:
-            HeightMin = HeightCurrent
-            LengthMax = LengthCurrent
-
-        psi += delta_psi
-
-    if HeightMin <= 0 or not np.isfinite(HeightMin) or not np.isfinite(LengthMax):
-        return (np.nan, np.nan, np.nan, np.nan, np.nan)
-
-    elongation = float(LengthMax / HeightMin)
-    bulkiness = float((LengthMax * HeightMin) / area)
-    surface = float((perimeter ** 2) / (4.0 * Pi * area))
-    circularity = float(2.0 * np.sqrt(Pi * area) / perimeter)
-
-    distances = np.sqrt((x - Xm) ** 2 + (y - Ym) ** 2)
-    radius = float(np.max(distances))
-    sphericity = 0.0 if radius <= 0 else float((np.sqrt(area / Pi) / radius))
-    return elongation, bulkiness, surface, circularity, sphericity
-
-
+# =============================================================================
+# Better R² for closed contours (phase-safe)
+# =============================================================================
+def _resample_closed_contour(x: np.ndarray, y: np.ndarray, m: int = 200) -> Tuple[np.ndarray, np.ndarray]:
+    x, y = _ensure_closed(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+    if len(x) < 4:
+        return x, y
+
+    dx = np.diff(x)
+    dy = np.diff(y)
+    ds = np.hypot(dx, dy)
+    ds[ds == 0] = 1e-12
+    s = np.concatenate(([0.0], np.cumsum(ds)))
+    total = float(s[-1]) if float(s[-1]) > 0 else 1.0
+
+    u = np.linspace(0.0, total, m, endpoint=False)
+    xr = np.interp(u, s, x)
+    yr = np.interp(u, s, y)
+    return xr, yr
+
+
+def _best_shift_sse(A: np.ndarray, B: np.ndarray) -> float:
+    m = A.shape[0]
+    best = np.inf
+    for k in range(m):
+        sse = float(np.sum((A - np.roll(B, k, axis=0)) ** 2))
+        if sse < best:
+            best = sse
+    return best
+
+
+def contour_fit_metrics(x, y, xt, yt, m: int = 200) -> Tuple[float, float, float]:
+    x1, y1 = _resample_closed_contour(x, y, m=m)
+    x2, y2 = _resample_closed_contour(xt, yt, m=m)
+
+    A = np.stack([x1, y1], axis=1)
+    B = np.stack([x2, y2], axis=1)
+
+    sse = min(_best_shift_sse(A, B), _best_shift_sse(A, B[::-1]))
+    sst = float(np.sum((A - A.mean(axis=0)) ** 2))
+    r2 = 1.0 - sse / max(sst, 1e-12)
+
+    rmse = float(np.sqrt(sse / max(m, 1)))
+    denom = float(np.sqrt(sst / max(m, 1)))
+    nrmse = rmse / max(denom, 1e-12)
+    return r2, rmse, nrmse
+
+
+# =============================================================================
+# Fixed computation params (removed from sidebar)
+# =============================================================================
 @dataclass(frozen=True)
 class ShapeParams:
     n_harmonics: int = 16
@@ -596,134 +357,136 @@ class ShapeParams:
     flag_start: int = 1
 
 
-def compute_shape_indices(df_xy: pd.DataFrame, params: ShapeParams, progress_cb=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if not SCIPY_SPECIAL_AVAILABLE:
-        raise RuntimeError("This computation requires SciPy (scipy.special.elliprf/elliprd).")
+PARAMS_FIXED = ShapeParams(
+    n_harmonics=16,
+    no_sum=16,
+    large_limit=100.0,
+    small_limit=1e-5,
+    flag_location=1,
+    flag_scale=1,
+    flag_rotation=1,
+    flag_start=1,
+)
 
-    df = df_xy.copy()
-    df["ID"] = df["ID"].astype(str)
-    df["X"] = pd.to_numeric(df["X"], errors="coerce")
-    df["Y"] = pd.to_numeric(df["Y"], errors="coerce")
-    df = df.dropna(subset=["ID", "X", "Y"])
 
+# =============================================================================
+# Batch computation
+# =============================================================================
+def compute_shape_indices(df_xy: pd.DataFrame, params: ShapeParams) -> Tuple[pd.DataFrame, pd.DataFrame]:
     results = []
     errors = []
 
-    groups = df.groupby("ID", sort=False)
-    ids = list(groups.groups.keys())
-    total = len(ids)
+    no_sum = int(max(1, min(params.no_sum, params.n_harmonics)))
 
-    for idx, pid in enumerate(ids, start=1):
-        g = groups.get_group(pid)
-        x = g["X"].to_numpy(dtype=float)
-        y = g["Y"].to_numpy(dtype=float)
-
-        if len(x) < 3:
-            errors.append({"ID": pid, "error": "Not enough points (<3)."})
-            if progress_cb:
-                progress_cb(idx, total, pid)
-            continue
-
+    for pid, g in df_xy.groupby("ID"):
         try:
-            xmid, ymid = OutlineCentroid(x, y)
-            Ax, Bx, Ay, By, scale1, rotate_angle, start_angle = CoefNormalization(
-                x, y, xmid, ymid,
-                flag_location=params.flag_location,
-                flag_scale=params.flag_scale,
-                flag_rotation=params.flag_rotation,
-                flag_start=params.flag_start,
-                n_harmonics=params.n_harmonics,
-            )
+            x = g["X"].to_numpy(dtype=float)
+            y = g["Y"].to_numpy(dtype=float)
+            if len(x) < 3:
+                raise ValueError("Too few points")
 
-            ae, be, k, Le, rc, Uc, S1, S2, *_rest, Ass1, Ass2, P = ShapeIndicesEF(
-                Ax, Bx, Ay, By,
-                no_sum=params.no_sum,
-                large_limit=params.large_limit,
-                small_limit=params.small_limit,
-                xmid=xmid, ymid=ymid,
-                flag_scale=params.flag_scale,
-                scale1=scale1,
-                psi=rotate_angle,
-                start_angle=start_angle,
-                x=x, y=y,
-                n_harmonics=params.n_harmonics,
-                flag_rotation=params.flag_rotation,
-            )
+            x, y = _ensure_closed(x, y)
 
-            angularity = ComputeAngularity(Ax, Bx, Ay, By, n_harmonics=params.no_sum, w=360)
             area = OutlineArea(x, y)
-            perimeter = OutlinePerimeter(x, y)
-            elongation, bulkiness, surface, circularity, sphericity = ShapeFactors(x, y, area, perimeter)
+            per = OutlinePerimeter(x, y)
 
-            results.append({
-                "Original_ID": pid,
-                "Elongation_ratio": k,
-                "Angularity": angularity,
-                "Surface_roughness": Uc,
-                "Assymetry": Ass1,
-                "Assymetry_normalized": Ass2,
-                "Polygonality": P,
-                "Area": area,
-                "Perimeter": perimeter,
-                "Elongation": elongation,
-                "Bulkiness": bulkiness,
-                "Surface": surface,
-                "Circularity": circularity,
-                "Sphericity": sphericity,
-            })
+            cx, cy, a, b, theta = fit_ellipse_equal_area(x, y)
+            ell_per = ellipse_perimeter(a, b)
+
+            k = float(a / b) if b > 0 else float("nan")
+            elongation = float(1.0 - (b / a)) if a > 0 else float("nan")
+
+            Ax, Bx, Ay, By = ComputeEllFourierCoef(x, y, int(params.n_harmonics))
+
+            eps = 1e-12
+            E = np.array(
+                [float(Ax[n] ** 2 + Bx[n] ** 2 + Ay[n] ** 2 + By[n] ** 2) for n in range(1, no_sum + 1)],
+                dtype=float,
+            )
+            E_total = float(np.sum(E) + eps)
+
+            P = float(np.sum(E[1:]) / E_total) if len(E) >= 2 else 0.0
+
+            Ex = float(np.sum([Ax[n] ** 2 + Bx[n] ** 2 for n in range(1, no_sum + 1)]) + eps)
+            Ey = float(np.sum([Ay[n] ** 2 + By[n] ** 2 for n in range(1, no_sum + 1)]) + eps)
+
+            # IMPORTANT: keep exact spelling for Module 2
+            Ass = float(abs(Ex - Ey) / (Ex + Ey))  # Assymmetricity
+            Ass_norm = float(Ass / max(P, eps))
+
+            angularity = float(np.clip((per / max(ell_per, eps)) - 1.0, 0.0, params.large_limit))
+
+            circularity, sphericity, bulkiness, roughness = ShapeFactors(area, per)
+
+            results.append(
+                {
+                    "Original_ID": pid,
+                    "Elongation_ratio": k,
+                    "Elongation": elongation,
+                    "Angularity": angularity,
+                    "Surface_roughness": roughness,
+                    "Assymmetricity": Ass,
+                    "Assymmetricity_normalized": Ass_norm,
+                    "Polygonality": P,
+                    "Area": area,
+                    "Perimeter": per,
+                    "Bulkiness": bulkiness,
+                    "Surface": per,
+                    "Circularity": circularity,
+                    "Sphericity": sphericity,
+                }
+            )
+
         except Exception as e:
-            errors.append({"ID": pid, "error": repr(e)})
-
-        if progress_cb:
-            progress_cb(idx, total, pid)
+            errors.append({"ID": pid, "error": str(e)})
 
     return pd.DataFrame(results), pd.DataFrame(errors)
 
 
-# =============================================================================
-# Page helpers
-# =============================================================================
 def points_per_particle(df_xy: pd.DataFrame) -> pd.DataFrame:
-    return df_xy.groupby("ID", sort=False).size().reset_index(name="n_points").sort_values("n_points")
+    return (
+        df_xy.groupby("ID")
+        .size()
+        .reset_index(name="n_points")
+        .sort_values("n_points")
+        .reset_index(drop=True)
+    )
 
 
+# =============================================================================
+# Module 1 plots
+# =============================================================================
 def plot_reconstruction_spatial_efd(x: np.ndarray, y: np.ndarray, N: int):
-    """Original vs reconstruction using spatial_efd, compact figure."""
-    if len(x) >= 3 and (x[0] != x[-1] or y[0] != y[-1]):
-        x = np.append(x, x[0]); y = np.append(y, y[0])
-
+    x, y = _ensure_closed(x, y)
     coeffs = spatial_efd.CalculateEFD(x, y, N)
     locus = spatial_efd.calculate_dc_coefficients(x, y)
     xt, yt = spatial_efd.inverse_transform(coeffs, harmonic=N, locus=locus)
 
-    fig, ax = plt.subplots(figsize=(4.2, 4.2), dpi=170)
-    ax.plot(x, y, linewidth=1.6, label="Original")
-    ax.plot(xt, yt, linewidth=1.6, label=f"Reconstruction (N={N})")
+    fig, ax = plt.subplots(figsize=(3.6, 3.6), dpi=170)
+    ax.plot(x, y, linewidth=1.3, label="Original")
+    ax.plot(xt, yt, linewidth=1.3, label=f"Reconstruction (N={N})")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=9)
     ax.set_title("Outline reconstruction", fontsize=11)
-    return fig
+    return fig, xt, yt
 
 
 def plot_ellipse_and_circle(x: np.ndarray, y: np.ndarray):
-    """Approximate ellipse via N=1 + equal-area circle."""
-    if len(x) >= 3 and (x[0] != x[-1] or y[0] != y[-1]):
-        x = np.append(x, x[0]); y = np.append(y, y[0])
+    cx, cy, a, b, theta = fit_ellipse_equal_area(x, y)
+    r = equal_area_circle_radius(x, y)
 
-    coeffs1 = spatial_efd.CalculateEFD(x, y, 1)
-    locus = spatial_efd.calculate_dc_coefficients(x, y)
-    xt1, yt1 = spatial_efd.inverse_transform(coeffs1, harmonic=1, locus=locus)
+    t = np.linspace(0, 2 * np.pi, 300)
+    ex = cx + a * np.cos(t) * np.cos(theta) - b * np.sin(t) * np.sin(theta)
+    ey = cy + a * np.cos(t) * np.sin(theta) + b * np.sin(t) * np.cos(theta)
 
-    area = OutlineArea(x, y)
-    cx, cy = OutlineCentroid(x, y)
-    r = np.sqrt(area / np.pi) if area > 0 else 0.0
+    cxr = cx + r * np.cos(t)
+    cyr = cy + r * np.sin(t)
 
-    fig, ax = plt.subplots(figsize=(4.2, 4.2), dpi=170)
-    ax.plot(x, y, linewidth=1.5, label="Original")
-    ax.plot(xt1, yt1, linewidth=1.8, label="Approx. ellipse (N=1)")
-    if r > 0:
-        ax.add_patch(Circle((cx, cy), r, fill=False, linewidth=1.8, linestyle="--", label="Equal-area circle"))
+    fig, ax = plt.subplots(figsize=(3.6, 3.6), dpi=170)
+    ax.plot(x, y, linewidth=1.3, label="Original")
+    ax.plot(ex, ey, linewidth=1.3, label="Ellipse (equal area)")
+    ax.plot(cxr, cyr, linewidth=1.3, label="Equal-area circle")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=9)
@@ -732,77 +495,80 @@ def plot_ellipse_and_circle(x: np.ndarray, y: np.ndarray):
 
 
 # =============================================================================
-# Streamlit app
+# Streamlit UI
 # =============================================================================
 st.set_page_config(page_title="Shape Analysis", layout="wide")
 st.title("🔬 Shape Analysis")
 
 uploaded = st.sidebar.file_uploader("Upload CSV (ID, X, Y)", type=["csv"])
 
-st.sidebar.markdown("---")
-id_mode = st.sidebar.selectbox("Particle ID display", ["Sequential P001", "Original"], index=0)
+compact_mode = st.sidebar.checkbox("Compact mode (collapse figures)", value=True)
+EXPANDED = not compact_mode
 
-st.sidebar.markdown("---")
-page = st.sidebar.radio("Pages", ["1) Single particle", "2) Sensitivity analysis", "3) Whole sample"], index=0)
-
-st.sidebar.markdown("---")
-st.sidebar.header("Computation parameters")
-
-with st.sidebar.expander("Fourier / index settings", expanded=False):
-    n_harmonics = st.number_input("No. harmonics (EFD)", min_value=1, max_value=128, value=16, step=1)
-    no_sum = st.number_input("No_sum (used in indices)", min_value=1, max_value=128, value=16, step=1)
-    large_limit = st.number_input("LargeLimit", min_value=1.0, value=100.0, step=1.0)
-    small_limit = st.number_input("SmallLimit", min_value=0.0, value=1e-5, format="%.8f")
-
-with st.sidebar.expander("Normalization flags", expanded=False):
-    flag_location = st.selectbox("FlagLocation (center to centroid)", [0, 1], index=1)
-    flag_scale = st.selectbox("FlagScale (size invariant)", [0, 1], index=1)
-    flag_rotation = st.selectbox("FlagRotation (rotation invariant)", [0, 1], index=1)
-    flag_start = st.selectbox("FlagStart (start point invariant)", [0, 1], index=1)
-
-params = ShapeParams(
-    n_harmonics=int(n_harmonics),
-    no_sum=int(no_sum),
-    large_limit=float(large_limit),
-    small_limit=float(small_limit),
-    flag_location=int(flag_location),
-    flag_scale=int(flag_scale),
-    flag_rotation=int(flag_rotation),
-    flag_start=int(flag_start),
+font_size = st.sidebar.slider("Text size", min_value=14, max_value=24, value=18, step=1)
+st.markdown(
+    f"""
+    <style>
+      html, body, [class*="css"] {{ font-size: {font_size}px !important; }}
+      section[data-testid="stSidebar"] * {{ font-size: {font_size}px !important; }}
+      .stMetricValue {{ font-size: {min(font_size+12, 34)}px !important; }}
+      .stMetricLabel {{ font-size: {max(font_size-2, 12)}px !important; }}
+    </style>
+    """,
+    unsafe_allow_html=True
 )
+
+st.sidebar.markdown("---")
+module = st.sidebar.radio("Modules", ["Module 1", "Module 2", "Module 3"], index=0)
+
+st.sidebar.markdown("---")
+with st.sidebar.expander("📏 Units / Calibration (px → mm)", expanded=True):
+    px_per_mm = st.number_input("Pixels per mm (px/mm)", min_value=0.0001, value=77.0, step=0.1)
+    st.caption("Perimeter_mm = Perimeter_px / (px/mm)")
+    st.caption("Area_mm² = Area_px² / (px/mm)²")
 
 if uploaded is None:
     st.info("⬅️ Upload a CSV to start.")
-    render_instruction_figures()
+    st.caption("Expected columns: ID, X, Y.")
     st.stop()
 
-if not SCIPY_SPECIAL_AVAILABLE:
-    st.error("SciPy is required for this app: `pip install scipy`.")
-    st.stop()
+file_bytes = uploaded.getvalue()
+file_hash = hashlib.md5(file_bytes).hexdigest()
 
 @st.cache_data(show_spinner=False)
-def _load(file_bytes: bytes) -> pd.DataFrame:
-    return load_xy_csv(file_bytes)
+def _load_cached(h: str, b: bytes) -> pd.DataFrame:
+    return load_xy_csv(b)
 
-df_xy = _load(uploaded.getvalue())
+df_xy = _load_cached(file_hash, file_bytes)
 if df_xy.empty:
     st.error("CSV loaded but has no valid rows for ID/X/Y.")
     st.stop()
 
 original_ids = df_xy["ID"].dropna().astype(str).unique().tolist()
-id_map = make_id_mapping(original_ids, id_mode)
+id_map = make_id_mapping(original_ids)
 reverse_map = {v: k for k, v in id_map.items()}
 
 st.caption(f"Detected **{df_xy['ID'].nunique()}** particles and **{len(df_xy)}** outline points.")
 
-# ---------------- Page 1 ----------------
-if page.startswith("1"):
-    st.header("1) Single particle")
-    render_instruction_figures()
 
-    pts = points_per_particle(df_xy)
-    if int(pts["n_points"].min()) < 20:
-        st.warning("Some particles have very few points (<20). Reconstruction may be unstable.")
+# =============================================================================
+# Module 1
+# =============================================================================
+if module == "Module 1":
+    st.header("Module 1 — Outline Reconstruction")
+
+    with st.expander("📘 Instructions", expanded=True):
+        st.write(
+            "Choose **one** particle and harmonic orders from **1 to 40**. "
+            "Observe **R² / RMSE** and how the outline converges to the original shape."
+        )
+
+    show_images(
+        ["module1_1.png", "module1_2.png"],
+        "📌 Module 1 instructions (figure)",
+        expanded=EXPANDED,
+        ncols=1
+    )
 
     display_ids = [id_map[o] for o in original_ids]
     chosen_display = st.selectbox("Choose particle", display_ids, index=0)
@@ -816,70 +582,107 @@ if page.startswith("1"):
         st.error("This particle has <3 points.")
         st.stop()
 
+    area_px2 = float(OutlineArea(x, y))
+    per_px = float(OutlinePerimeter(x, y))
+
+    c1, c2, c3 = st.columns([1.0, 1.0, 1.0])
+    with c1:
+        st.metric("Area (px²)", f"{area_px2:.4g}")
+        st.metric("Area (mm²)", f"{px2_to_mm2(area_px2, px_per_mm):.4g}")
+    with c2:
+        st.metric("Perimeter (px)", f"{per_px:.4g}")
+        st.metric("Perimeter (mm)", f"{px_to_mm(per_px, px_per_mm):.4g}")
+    with c3:
+        st.metric("px/mm", f"{px_per_mm:.4g}")
+
     if not SPATIAL_EFD_AVAILABLE:
-        st.error("Page 1 needs `spatial_efd`. Install: `pip install spatial_efd`.")
+        st.warning("Module 1 reconstruction needs `spatial_efd` (pip install spatial_efd).")
         st.stop()
 
     nyq = int(spatial_efd.Nyquist(x))
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        N = st.slider("Number of harmonics (N)", min_value=1, max_value=max(1, nyq), value=min(10, max(1, nyq)))
-        st.caption(f"Nyquist limit: **{nyq}**")
-    with c2:
-        st.caption("Small N → smooth outline; larger N → more detail/noise.")
+    maxN = max(1, min(40, nyq))
+    N = st.slider("Harmonic order (k)", min_value=1, max_value=maxN, value=min(10, maxN))
+    st.caption(f"Nyquist limit: **{nyq}** (k slider capped at **{maxN}**)")
 
-    left, right = st.columns(2)
-    with left:
-        st.pyplot(plot_reconstruction_spatial_efd(x, y, int(N)), use_container_width=True)
-    with right:
-        st.pyplot(plot_ellipse_and_circle(x, y), use_container_width=True)
+    try:
+        fig_rec, xt, yt = plot_reconstruction_spatial_efd(x, y, int(N))
+        r2, rmse_px, nrmse = contour_fit_metrics(x, y, xt, yt, m=200)
 
-# ---------------- Page 2 ----------------
-elif page.startswith("2"):
-    st.header("2) Sensitivity analysis")
-    st.caption("Assymetry and Polygonality distributions across particles for selected numbers of harmonics.")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Reconstruction Quality (R²)", f"{r2:.3f}")
+        m2.metric("RMSE (px)", f"{rmse_px:.4g}")
+        m3.metric("NRMSE", f"{nrmse:.4g}")
+    except Exception as e:
+        st.warning(f"Reconstruction metric failed: {e}")
+        fig_rec = None
 
-    # Pick harmonics explicitly (default like your example)
-    max_h = 50
+    with st.expander("📈 Figures", expanded=EXPANDED):
+        left, right = st.columns(2)
+        with left:
+            if fig_rec is not None:
+                st.pyplot(fig_rec, use_container_width=True)
+        with right:
+            st.pyplot(plot_ellipse_and_circle(x, y), use_container_width=True)
+
+
+# =============================================================================
+# Module 2
+# =============================================================================
+elif module == "Module 2":
+    st.header("Module 2 — Sensitivity Analysis")
+
+    with st.expander("📘 Instructions", expanded=True):
+        st.write(
+            "Apply different harmonic orders to the whole dataset. "
+            "Observe how **Assymmetricity** and **Polygonality** stabilize as harmonics increase."
+        )
+
+    show_images(["Module2_1.png"], "📌 Module 2 instructions (figure)", expanded=EXPANDED, ncols=1)
+
+    max_h = 40
     default_N = [1, 2, 5, 10, 15, 20]
-    options = list(range(1, max_h + 1))
     chosen_N = st.multiselect(
         "Select harmonics to evaluate",
-        options=options,
+        options=list(range(1, max_h + 1)),
         default=[n for n in default_N if n <= max_h],
     )
-
     chosen_N = sorted(set(int(n) for n in chosen_N))
     if not chosen_N:
-        st.info("Select at least one harmonic number.")
+        st.info("Choose at least one harmonic order to evaluate.")
         st.stop()
 
-    st.caption(f"Selected: {', '.join(map(str, chosen_N))}")
+    current_key = (file_hash, tuple(chosen_N))  # params are fixed
+
+    if st.session_state.get("module2_key") == current_key:
+        sens = st.session_state.get("module2_sens")
+        if sens is not None:
+            st.success("Using saved sensitivity results (no need to rerun).")
+    else:
+        sens = None
+        st.info("Settings changed. Click **Run sensitivity** to compute.")
 
     @st.cache_data(show_spinner=False)
-    def _compute_for_N(file_hash: str, df_xy: pd.DataFrame, params_base: ShapeParams, N: int) -> pd.DataFrame:
+    def _compute_for_N(h: str, df_xy_local: pd.DataFrame, N: int) -> pd.DataFrame:
+        # assignment-style: n_harmonics=no_sum=N
         p = ShapeParams(
             n_harmonics=int(N),
             no_sum=int(N),
-            large_limit=params_base.large_limit,
-            small_limit=params_base.small_limit,
-            flag_location=params_base.flag_location,
-            flag_scale=params_base.flag_scale,
-            flag_rotation=params_base.flag_rotation,
-            flag_start=params_base.flag_start,
+            large_limit=PARAMS_FIXED.large_limit,
+            small_limit=PARAMS_FIXED.small_limit,
+            flag_location=PARAMS_FIXED.flag_location,
+            flag_scale=PARAMS_FIXED.flag_scale,
+            flag_rotation=PARAMS_FIXED.flag_rotation,
+            flag_start=PARAMS_FIXED.flag_start,
         )
-        res, _err = compute_shape_indices(df_xy, p)
+        res, _ = compute_shape_indices(df_xy_local, p)
         if res.empty:
             return pd.DataFrame()
-        out = res[["Original_ID", "Assymetry", "Polygonality"]].copy()
+        out = res[["Original_ID", "Assymmetricity", "Polygonality"]].copy()
         out["Harmonics"] = int(N)
         return out
 
     run = st.button("Run sensitivity", type="primary")
     if run:
-        import hashlib
-        file_hash = hashlib.md5(uploaded.getvalue()).hexdigest()
-
         prog = st.progress(0)
         status = st.empty()
 
@@ -887,12 +690,10 @@ elif page.startswith("2"):
         total = len(chosen_N)
         for i, N in enumerate(chosen_N, start=1):
             status.write(f"Computing N = {N}  ({i}/{total})")
-            try:
-                part = _compute_for_N(file_hash, df_xy, params, int(N))
-                if not part.empty:
-                    rows.append(part)
-            finally:
-                prog.progress(int(100 * i / max(total, 1)))
+            part = _compute_for_N(file_hash, df_xy, int(N))
+            if not part.empty:
+                rows.append(part)
+            prog.progress(int(i / max(total, 1) * 100))
 
         status.empty()
         prog.empty()
@@ -904,165 +705,159 @@ elif page.startswith("2"):
         sens = pd.concat(rows, ignore_index=True)
         sens["Particle_ID"] = sens["Original_ID"].map(id_map).fillna(sens["Original_ID"])
 
-        st.subheader("Assymetry vs harmonics")
-        figA = px.box(sens, x="Harmonics", y="Assymetry", points="outliers", hover_data=["Particle_ID"])
-        figA.update_layout(xaxis_title="Number of harmonics", yaxis_title="Assymetry")
+        st.session_state["module2_sens"] = sens
+        st.session_state["module2_key"] = current_key
+
+    if sens is None:
+        st.stop()
+
+    sens_sel = sens[sens["Harmonics"].isin(chosen_N)].copy()
+    sens_sel["Harmonics_cat"] = sens_sel["Harmonics"].astype(str)
+    cat_order = [str(n) for n in chosen_N]
+
+    with st.expander("📦 Boxplots (no empty places)", expanded=EXPANDED):
+        figA = px.box(
+            sens_sel,
+            x="Harmonics_cat",
+            y="Assymmetricity",
+            points="outliers",
+            height=320,
+            title="Assymmetricity vs harmonics",
+        )
+        figA.update_xaxes(type="category", categoryorder="array", categoryarray=cat_order, title="Number of harmonics")
+        figA.update_layout(yaxis_title="Assymmetricity")
         st.plotly_chart(figA, use_container_width=True)
 
-        st.subheader("Polygonality vs harmonics")
-        figP = px.box(sens, x="Harmonics", y="Polygonality", points="outliers", hover_data=["Particle_ID"])
-        figP.update_layout(xaxis_title="Number of harmonics", yaxis_title="Polygonality")
+        figP = px.box(
+            sens_sel,
+            x="Harmonics_cat",
+            y="Polygonality",
+            points="outliers",
+            height=320,
+            title="Polygonality vs harmonics",
+        )
+        figP.update_xaxes(type="category", categoryorder="array", categoryarray=cat_order, title="Number of harmonics")
+        figP.update_layout(yaxis_title="Polygonality")
         st.plotly_chart(figP, use_container_width=True)
 
-        st.markdown("### Sensitivity data")
-        st.dataframe(sens.sort_values(["Harmonics", "Particle_ID"]), use_container_width=True)
+    with st.expander("📉 Optional: stabilization trend (median)", expanded=False):
+        trend = sens.groupby("Harmonics")[["Assymmetricity", "Polygonality"]].median().reset_index()
+        cA, cP = st.columns(2)
+        with cA:
+            st.plotly_chart(
+                px.line(trend, x="Harmonics", y="Assymmetricity", markers=True, height=300,
+                        title="Median Assymmetricity vs harmonics"),
+                use_container_width=True,
+            )
+        with cP:
+            st.plotly_chart(
+                px.line(trend, x="Harmonics", y="Polygonality", markers=True, height=300,
+                        title="Median Polygonality vs harmonics"),
+                use_container_width=True,
+            )
 
-        st.download_button(
-            "⬇️ Download sensitivity CSV",
-            data=sens.to_csv(index=False).encode("utf-8"),
-            file_name="sensitivity_assymetry_polygonality.csv",
-            mime="text/csv",
+    with st.expander("🧾 Sensitivity table", expanded=EXPANDED):
+        st.dataframe(
+            sens_sel[["Particle_ID", "Harmonics", "Assymmetricity", "Polygonality"]].sort_values(["Harmonics", "Particle_ID"]),
+            use_container_width=True,
         )
 
-# ---------------- Page 3 ----------------
+    st.download_button(
+        "⬇️ Download sensitivity CSV",
+        data=sens.to_csv(index=False).encode("utf-8"),
+        file_name="sensitivity_assymmetricity_polygonality.csv",
+        mime="text/csv",
+    )
+
+
+# =============================================================================
+# Module 3
+# =============================================================================
 else:
-    st.header("3) Whole sample")
+    st.header("Module 3 — Statistics")
+
+    with st.expander("📘 Instructions", expanded=True):
+        st.write(
+            "Run batch analysis, plot distributions (Elongation, Angularity, Roughness), "
+            "and export correlation matrix to find redundant descriptors."
+        )
+
+    show_images(["Module3_1.png", "Module3_2.png", "Module3_3.png", "Module3_4.png"],
+                "📌 Module 3 instructions (figures)", expanded=EXPANDED, ncols=2)
 
     with st.expander("Outline quality check", expanded=False):
         st.dataframe(points_per_particle(df_xy), use_container_width=True)
-        st.caption("Low point counts can cause unstable indices.")
 
-    run = st.button("Run shape analysis", type="primary")
-    if run:
-        st.session_state.pop("results_df", None)
-        st.session_state.pop("errors_df", None)
+    key3 = (file_hash, float(px_per_mm))  # params fixed
 
-        progress = st.progress(0)
-        status = st.empty()
+    if st.session_state.get("module3_key") == key3:
+        results_df = st.session_state.get("module3_results")
+        errors_df = st.session_state.get("module3_errors")
+        if results_df is not None:
+            st.success("Using saved Module 3 results (no need to rerun).")
+    else:
+        results_df = None
+        errors_df = None
+        st.info("Settings changed. Click **Run batch shape indices** to compute.")
 
-        t0 = time.time()
+    run3 = st.button("Run batch shape indices", type="primary")
+    if run3:
+        res, err = compute_shape_indices(df_xy, PARAMS_FIXED)
+        if res.empty:
+            st.error("No results produced.")
+            st.stop()
 
-        def progress_cb(i, total, pid):
-            progress.progress(int(100 * i / max(total, 1)))
-            status.write(f"Processing {id_map.get(pid, pid)} ({i}/{total})")
+        res = res.copy()
+        res["Particle_ID"] = res["Original_ID"].map(id_map).fillna(res["Original_ID"])
 
-        with st.spinner("Computing shape indices..."):
-            results_df, errors_df = compute_shape_indices(df_xy, params, progress_cb=progress_cb)
+        res["Area_mm2"] = res["Area"].apply(lambda v: px2_to_mm2(v, px_per_mm))
+        res["Perimeter_mm"] = res["Perimeter"].apply(lambda v: px_to_mm(v, px_per_mm))
+        res["Surface_mm"] = res["Surface"].apply(lambda v: px_to_mm(v, px_per_mm))
 
-        dt = time.time() - t0
-        progress.empty()
-        status.empty()
+        st.session_state["module3_results"] = res
+        st.session_state["module3_errors"] = err
+        st.session_state["module3_key"] = key3
 
-        results_df = results_df.copy()
-        results_df["Particle_ID"] = results_df["Original_ID"].map(id_map).fillna(results_df["Original_ID"])
-        results_df = results_df[["Particle_ID"] + [c for c in results_df.columns if c != "Particle_ID"]]
-
-        st.session_state["results_df"] = results_df
-        st.session_state["errors_df"] = errors_df
-
-        st.success(f"Done. Computed {len(results_df)} particles in {dt:.2f}s.")
-        if errors_df is not None and len(errors_df):
-            st.warning(f"{len(errors_df)} particles failed (see Errors).")
-
-    results_df = st.session_state.get("results_df")
-    errors_df = st.session_state.get("errors_df")
+        results_df = res
+        errors_df = err
 
     if results_df is None:
-        st.info("Click **Run shape analysis** to compute results.")
         st.stop()
 
     st.subheader("Results")
     st.dataframe(results_df, use_container_width=True)
 
     st.download_button(
-        "⬇️ Download results CSV",
+        "⬇️ Download full CSV",
         data=results_df.to_csv(index=False).encode("utf-8"),
-        file_name="shape_indices_results.csv",
+        file_name="shape_indices_full.csv",
         mime="text/csv",
     )
 
-    if errors_df is not None and len(errors_df):
+    if errors_df is not None and not errors_df.empty:
         with st.expander("Errors", expanded=False):
             st.dataframe(errors_df, use_container_width=True)
-            st.download_button(
-                "⬇️ Download errors CSV",
-                data=errors_df.to_csv(index=False).encode("utf-8"),
-                file_name="shape_indices_errors.csv",
-                mime="text/csv",
-            )
 
-    st.markdown("---")
-    st.subheader("Analytics tools")
-
-    numeric_cols = results_df.select_dtypes(include="number").columns.tolist()
-    if not numeric_cols:
-        st.info("No numeric columns found.")
-        st.stop()
-
-    # Filters
-    with st.expander("Filters", expanded=False):
-        id_search = st.text_input("Search Particle_ID", value="")
-        filtered = results_df.copy()
-        if id_search.strip():
-            filtered = filtered[filtered["Particle_ID"].astype(str).str.contains(id_search.strip(), case=False, na=False)]
-
-        filter_cols = st.multiselect("Numeric columns to filter", numeric_cols, default=[])
-        for c in filter_cols:
-            col_vals = filtered[c].dropna()
-            if col_vals.empty:
-                continue
-            lo, hi = float(col_vals.min()), float(col_vals.max())
-            if lo == hi:
-                continue
-            rng = st.slider(f"{c} range", min_value=lo, max_value=hi, value=(lo, hi))
-            filtered = filtered[(filtered[c] >= rng[0]) & (filtered[c] <= rng[1])]
-
-        st.caption(f"Filtered rows: {len(filtered)} / {len(results_df)}")
-        st.dataframe(filtered, use_container_width=True)
-
-        st.download_button(
-            "⬇️ Download filtered CSV",
-            data=filtered.to_csv(index=False).encode("utf-8"),
-            file_name="shape_indices_filtered.csv",
-            mime="text/csv",
-        )
-
-    # Outliers (IQR)
-    with st.expander("Outliers (IQR)", expanded=False):
-        out_col = st.selectbox("Column for outlier detection", numeric_cols, index=0)
-        k_iqr = st.slider("IQR multiplier", 1.0, 3.0, 1.5, 0.1)
-        vals = results_df[out_col].dropna()
-        if len(vals) >= 4:
-            q1, q3 = np.percentile(vals, [25, 75])
-            iqr = q3 - q1
-            lo, hi = q1 - k_iqr * iqr, q3 + k_iqr * iqr
-            outliers = results_df[(results_df[out_col] < lo) | (results_df[out_col] > hi)]
-            st.caption(f"Outliers: {len(outliers)} (thresholds: {lo:.4g} .. {hi:.4g})")
-            st.dataframe(outliers[["Particle_ID", "Original_ID", out_col]], use_container_width=True)
-        else:
-            st.info("Not enough data for IQR outliers.")
-
-    # Charts
-    st.markdown("### Charts")
-    c1, c2 = st.columns(2)
-    with c1:
-        xcol = st.selectbox("X axis", numeric_cols, index=0)
-    with c2:
-        ycol = st.selectbox("Y axis", numeric_cols, index=min(1, len(numeric_cols) - 1))
-
-    st.plotly_chart(
-        px.scatter(filtered, x=xcol, y=ycol, hover_name="Particle_ID", title="Scatter plot (filtered)"),
-        use_container_width=True,
-    )
-
-    dist_col = st.selectbox("Distribution column", numeric_cols, index=0)
-    st.plotly_chart(
-        px.histogram(filtered, x=dist_col, nbins=30, title=f"Distribution: {dist_col}"),
-        use_container_width=True,
-    )
+    with st.expander("📊 Distributions (Elongation / Angularity / Roughness)", expanded=EXPANDED):
+        cols = st.columns(3)
+        plots = [("Elongation", "Elongation"), ("Angularity", "Angularity"), ("Surface_roughness", "Surface_roughness")]
+        for i, (col, title) in enumerate(plots):
+            with cols[i]:
+                if col in results_df.columns:
+                    st.plotly_chart(
+                        px.histogram(results_df, x=col, nbins=30, height=300, title=title),
+                        use_container_width=True,
+                    )
 
     with st.expander("Correlation matrix", expanded=False):
-        corr = filtered[numeric_cols].corr(method="pearson")
+        numeric_cols = [c for c in results_df.columns if pd.api.types.is_numeric_dtype(results_df[c])]
+        corr = results_df[numeric_cols].corr(method="pearson")
+        st.download_button(
+            "⬇️ Download correlation matrix (CSV)",
+            data=corr.to_csv().encode("utf-8"),
+            file_name="correlation_matrix.csv",
+            mime="text/csv",
+        )
         fig_corr = px.imshow(corr, aspect="auto", zmin=-1, zmax=1, title="Correlation (Pearson)")
         fig_corr.update_xaxes(side="bottom")
         st.plotly_chart(fig_corr, use_container_width=True)
