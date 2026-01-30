@@ -563,7 +563,7 @@ if module == "Module 1":
             "Observe **R² / RMSE** and how the outline converges to the original shape."
         )
 
-    show_images(["Module1_1.png", "Module1_2.png"], "📌 Module 1 instructions (figure)", expanded=EXPANDED, ncols=1)
+    show_images(["Module1_1.png", "Module1_2.png", "Module1_3.png"], "📌 Module 1 instructions (figure)", expanded=EXPANDED, ncols=1)
 
 
     display_ids = [id_map[o] for o in original_ids]
@@ -778,7 +778,7 @@ else:
             "and export correlation matrix to find redundant descriptors."
         )
 
-    show_images(["Module3_1.png", "Module3_2.png", "Module3_3.png", "Module3_4.png"],
+    show_images(["Module3_1.png", "Module3_2.png", "Module3_3.png", "Module3_4.png", "Module3_5.png"],
                 "📌 Module 3 instructions (figures)", expanded=EXPANDED, ncols=2)
 
     with st.expander("Outline quality check", expanded=False):
