@@ -1,14 +1,3 @@
-# Shape Analysis Streamlit App (single file) — Modules version
-# (NO computation parameters sidebar) + px/mm + fixed Module 2 + better R² + compact figures
-# ---------------------------------------------------------------------------------------------------------
-# Install:
-#   pip install streamlit numpy pandas scipy plotly pillow matplotlib
-# Optional (Module 1 reconstruction):
-#   pip install spatial_efd
-#
-# Run:
-#   python -m streamlit run app.py
-
 from __future__ import annotations
 
 import hashlib
@@ -26,21 +15,21 @@ import matplotlib.pyplot as plt
 
 # Optional: spatial_efd (Module 1)
 try:
-    import spatial_efd
+    import spatial_efd  # type: ignore
     SPATIAL_EFD_AVAILABLE = True
 except Exception:
     SPATIAL_EFD_AVAILABLE = False
 
 # Optional: SciPy special (ellipse perimeter). Fallback to Ramanujan if unavailable.
 try:
-    from scipy.special import elliprd, elliprf
+    from scipy.special import elliprd, elliprf  # type: ignore
     SCIPY_SPECIAL_AVAILABLE = True
 except Exception:
     SCIPY_SPECIAL_AVAILABLE = False
 
 
 # =============================================================================
-# Paths + instruction images (no absolute paths required)
+# Paths + instruction images
 # =============================================================================
 APP_DIR = Path(__file__).resolve().parent
 ASSETS_DIRS = [
@@ -68,8 +57,8 @@ def _resolve_image(path_or_name: str) -> Optional[Path]:
 
 
 def show_images(paths: List[str], title: str, expanded: bool, ncols: int = 2) -> None:
-    """Compact image grid inside one expander. Ignores missing images."""
-    resolved = []
+    """Image grid inside an expander. Ignores missing images."""
+    resolved: List[Path] = []
     for s in paths:
         p = _resolve_image(s)
         if p is not None:
@@ -132,7 +121,7 @@ def make_id_mapping(original_ids: List[str]) -> Dict[str, str]:
 
 
 # =============================================================================
-# Units calibration (px/mm)
+# Units (px/mm)
 # =============================================================================
 def px_to_mm(length_px: float, px_per_mm: float) -> float:
     px_per_mm = float(max(px_per_mm, 1e-12))
@@ -295,7 +284,7 @@ def ComputeEllFourierCoef(x: np.ndarray, y: np.ndarray, n_harmonics: int):
 
 
 # =============================================================================
-# Better R² for closed contours (phase-safe)
+# Contour-fit metrics (RMSE intentionally omitted)
 # =============================================================================
 def _resample_closed_contour(x: np.ndarray, y: np.ndarray, m: int = 200) -> Tuple[np.ndarray, np.ndarray]:
     x, y = _ensure_closed(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
@@ -325,7 +314,8 @@ def _best_shift_sse(A: np.ndarray, B: np.ndarray) -> float:
     return best
 
 
-def contour_fit_metrics(x, y, xt, yt, m: int = 200) -> Tuple[float, float, float]:
+def contour_fit_metrics(x, y, xt, yt, m: int = 200) -> Tuple[float, float]:
+    """Return (R², NRMSE). RMSE is not computed or displayed by design."""
     x1, y1 = _resample_closed_contour(x, y, m=m)
     x2, y2 = _resample_closed_contour(xt, yt, m=m)
 
@@ -334,16 +324,14 @@ def contour_fit_metrics(x, y, xt, yt, m: int = 200) -> Tuple[float, float, float
 
     sse = min(_best_shift_sse(A, B), _best_shift_sse(A, B[::-1]))
     sst = float(np.sum((A - A.mean(axis=0)) ** 2))
-    r2 = 1.0 - sse / max(sst, 1e-12)
 
-    rmse = float(np.sqrt(sse / max(m, 1)))
-    denom = float(np.sqrt(sst / max(m, 1)))
-    nrmse = rmse / max(denom, 1e-12)
-    return r2, rmse, nrmse
+    r2 = 1.0 - sse / max(sst, 1e-12)
+    nrmse = float(math.sqrt(sse / max(sst, 1e-12)))
+    return r2, nrmse
 
 
 # =============================================================================
-# Fixed computation params (removed from sidebar)
+# Fixed computation params
 # =============================================================================
 @dataclass(frozen=True)
 class ShapeParams:
@@ -405,12 +393,12 @@ def compute_shape_indices(df_xy: pd.DataFrame, params: ShapeParams) -> Tuple[pd.
             )
             E_total = float(np.sum(E) + eps)
 
+            # Polygonality: energy beyond the first harmonic (classic proxy)
             P = float(np.sum(E[1:]) / E_total) if len(E) >= 2 else 0.0
 
             Ex = float(np.sum([Ax[n] ** 2 + Bx[n] ** 2 for n in range(1, no_sum + 1)]) + eps)
             Ey = float(np.sum([Ay[n] ** 2 + By[n] ** 2 for n in range(1, no_sum + 1)]) + eps)
 
-            # IMPORTANT: keep exact spelling for Module 2
             Ass = float(abs(Ex - Ey) / (Ex + Ey))  # Assymmetricity
             Ass_norm = float(Ass / max(P, eps))
 
@@ -425,13 +413,12 @@ def compute_shape_indices(df_xy: pd.DataFrame, params: ShapeParams) -> Tuple[pd.
                     "Elongation": elongation,
                     "Angularity": angularity,
                     "Surface_roughness": roughness,
-                    "Assymmetricity": Ass,
-                    "Assymmetricity_normalized": Ass_norm,
+                    "Asymmetricity": Ass,
+                    "Asymmetricity_normalized": Ass_norm,
                     "Polygonality": P,
                     "Area": area,
                     "Perimeter": per,
                     "Bulkiness": bulkiness,
-                    "Surface": per,
                     "Circularity": circularity,
                     "Sphericity": sphericity,
                 }
@@ -443,31 +430,21 @@ def compute_shape_indices(df_xy: pd.DataFrame, params: ShapeParams) -> Tuple[pd.
     return pd.DataFrame(results), pd.DataFrame(errors)
 
 
-def points_per_particle(df_xy: pd.DataFrame) -> pd.DataFrame:
-    return (
-        df_xy.groupby("ID")
-        .size()
-        .reset_index(name="n_points")
-        .sort_values("n_points")
-        .reset_index(drop=True)
-    )
-
-
 # =============================================================================
 # Module 1 plots
 # =============================================================================
-def plot_reconstruction_spatial_efd(x: np.ndarray, y: np.ndarray, N: int):
+def plot_reconstruction_spatial_efd(x: np.ndarray, y: np.ndarray, K: int):
     x, y = _ensure_closed(x, y)
-    coeffs = spatial_efd.CalculateEFD(x, y, N)
+    coeffs = spatial_efd.CalculateEFD(x, y, K)
     locus = spatial_efd.calculate_dc_coefficients(x, y)
-    xt, yt = spatial_efd.inverse_transform(coeffs, harmonic=N, locus=locus)
+    xt, yt = spatial_efd.inverse_transform(coeffs, harmonic=K, locus=locus)
 
     fig, ax = plt.subplots(figsize=(3.6, 3.6), dpi=170)
-    ax.plot(x, y, linewidth=1.3, label="Original")
-    ax.plot(xt, yt, linewidth=1.3, label=f"Reconstruction (N={N})")
+    ax.plot(x, y, linewidth=1.3, label="original outline")
+    ax.plot(xt, yt, linewidth=1.3, label=f"Reconstructed (K={K})")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=9)
+    ax.legend(loc="best", fontsize=8)
     ax.set_title("Outline reconstruction", fontsize=11)
     return fig, xt, yt
 
@@ -484,14 +461,57 @@ def plot_ellipse_and_circle(x: np.ndarray, y: np.ndarray):
     cyr = cy + r * np.sin(t)
 
     fig, ax = plt.subplots(figsize=(3.6, 3.6), dpi=170)
-    ax.plot(x, y, linewidth=1.3, label="Original")
-    ax.plot(ex, ey, linewidth=1.3, label="Ellipse (equal area)")
-    ax.plot(cxr, cyr, linewidth=1.3, label="Equal-area circle")
+    ax.plot(x, y, linewidth=1.3, label="original outline")
+    ax.plot(ex, ey, linewidth=1.3, label="ellipse")
+    ax.plot(cxr, cyr, linewidth=1.3, label="Circle")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, alpha=0.25)
-    ax.legend(loc="best", fontsize=9)
-    ax.set_title("Ellipse & equal-area circle", fontsize=11)
+    ax.legend(loc="best", fontsize=8)
+    ax.set_title("Equla-area & Ellipse of circle", fontsize=11)
     return fig
+
+
+# =============================================================================
+# Figure_5-style histogram helper (percentiles legend)
+# =============================================================================
+def percentile_histogram(df: pd.DataFrame, col: str, xlabel: str) -> plt.Figure:
+    data = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
+    fig, ax = plt.subplots(figsize=(5.0, 4.0), dpi=170)
+
+    if data.size == 0:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.set_axis_off()
+        return fig
+
+    p10 = float(np.percentile(data, 10))
+    p50 = float(np.percentile(data, 50))
+    p90 = float(np.percentile(data, 90))
+
+    ax.hist(data, bins=30, density=True, alpha=0.7, edgecolor="black")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Probability")
+    ax.legend([f"10% = {p10:.3f}\n50% = {p50:.3f}\n90% = {p90:.3f}"], fontsize=11, frameon=True)
+    ax.grid(True, alpha=0.20)
+    fig.tight_layout()
+    return fig
+
+
+def general_statistics_table(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    numeric = df[cols].apply(pd.to_numeric, errors="coerce")
+    desc = numeric.describe(percentiles=[0.10, 0.50, 0.90]).T
+    desc = desc.rename(
+        columns={
+            "count": "count",
+            "mean": "mean",
+            "std": "std",
+            "min": "min",
+            "10%": "p10",
+            "50%": "p50",
+            "90%": "p90",
+            "max": "max",
+        }
+    )
+    return desc.reset_index().rename(columns={"index": "descriptor"})
 
 
 # =============================================================================
@@ -502,9 +522,7 @@ st.title("🔬 Shape Analysis")
 
 uploaded = st.sidebar.file_uploader("Upload CSV (ID, X, Y)", type=["csv"])
 
-compact_mode = st.sidebar.checkbox("Compact mode (collapse figures)", value=True)
-EXPANDED = not compact_mode
-
+# Left part: removed compact mode, kept text size
 font_size = st.sidebar.slider("Text size", min_value=14, max_value=24, value=18, step=1)
 st.markdown(
     f"""
@@ -515,17 +533,18 @@ st.markdown(
       .stMetricLabel {{ font-size: {max(font_size-2, 12)}px !important; }}
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
+
+EXPANDED = True
 
 st.sidebar.markdown("---")
 module = st.sidebar.radio("Modules", ["Module 1", "Module 2", "Module 3"], index=0)
 
 st.sidebar.markdown("---")
-with st.sidebar.expander("📏 Units / Calibration (px → mm)", expanded=True):
-    px_per_mm = st.number_input("Pixels per mm (px/mm)", min_value=0.0001, value=77.0, step=0.1)
-    st.caption("Perimeter_mm = Perimeter_px / (px/mm)")
-    st.caption("Area_mm² = Area_px² / (px/mm)²")
+# Renamed Units Calibration -> Set Scale; label px/mm; removed captions
+with st.sidebar.expander("📏 Set Scale", expanded=True):
+    px_per_mm = st.number_input("px/mm", min_value=0.0001, value=77.0, step=0.1)
 
 if uploaded is None:
     st.info("⬅️ Upload a CSV to start.")
@@ -535,9 +554,11 @@ if uploaded is None:
 file_bytes = uploaded.getvalue()
 file_hash = hashlib.md5(file_bytes).hexdigest()
 
+
 @st.cache_data(show_spinner=False)
 def _load_cached(h: str, b: bytes) -> pd.DataFrame:
     return load_xy_csv(b)
+
 
 df_xy = _load_cached(file_hash, file_bytes)
 if df_xy.empty:
@@ -557,17 +578,18 @@ st.caption(f"Detected **{df_xy['ID'].nunique()}** particles and **{len(df_xy)}**
 if module == "Module 1":
     st.header("Module 1 — Outline Reconstruction")
 
+    # RMSE removed from instructions and not computed anywhere in Module 1
     with st.expander("📘 Instructions", expanded=True):
         st.write(
             "Choose **one** particle and harmonic orders from **1 to 40**. "
-            "Observe **R² / RMSE** and how the outline converges to the original shape."
+            "Observe how the outline converges to the original shape."
         )
 
-    show_images(["Module1_1.png", "Module1_2.png"], "📌 Module 1 instructions (figure)", expanded=EXPANDED, ncols=1)
-
+    # Renamed figure section
+    show_images(["Module1_1.png", "Module1_2.png"], "📌 EFA method", expanded=EXPANDED, ncols=1)
 
     display_ids = [id_map[o] for o in original_ids]
-    chosen_display = st.selectbox("Choose particle", display_ids, index=0)
+    chosen_display = st.selectbox("Select ID", display_ids, index=0)
     chosen_original = reverse_map.get(chosen_display, chosen_display)
 
     g = df_xy[df_xy["ID"].astype(str) == str(chosen_original)]
@@ -596,23 +618,23 @@ if module == "Module 1":
         st.stop()
 
     nyq = int(spatial_efd.Nyquist(x))
-    maxN = max(1, min(40, nyq))
-    N = st.slider("Harmonic order (k)", min_value=1, max_value=maxN, value=min(10, maxN))
-    st.caption(f"Nyquist limit: **{nyq}** (k slider capped at **{maxN}**)")
+    maxK = max(1, min(40, nyq))
+    K = st.slider("Harmonic order (K)", min_value=1, max_value=maxK, value=min(10, maxK))
+    st.caption(f"Nyquist limit: **{nyq}** (K slider capped at **{maxK}**)")
 
     try:
-        fig_rec, xt, yt = plot_reconstruction_spatial_efd(x, y, int(N))
-        r2, rmse_px, nrmse = contour_fit_metrics(x, y, xt, yt, m=200)
+        fig_rec, xt, yt = plot_reconstruction_spatial_efd(x, y, int(K))
+        r2, nrmse = contour_fit_metrics(x, y, xt, yt, m=200)
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2 = st.columns(2)
         m1.metric("Reconstruction Quality (R²)", f"{r2:.3f}")
-        m2.metric("RMSE (px)", f"{rmse_px:.4g}")
-        m3.metric("NRMSE", f"{nrmse:.4g}")
+        m2.metric("NRMSE", f"{nrmse:.4g}")
     except Exception as e:
         st.warning(f"Reconstruction metric failed: {e}")
         fig_rec = None
 
-    with st.expander("📈 Figures", expanded=EXPANDED):
+    # Renamed "Figures" -> "Reconstruction of selected particle"
+    with st.expander("Reconstruction of selected particle", expanded=EXPANDED):
         left, right = st.columns(2)
         with left:
             if fig_rec is not None:
@@ -627,18 +649,17 @@ if module == "Module 1":
 elif module == "Module 2":
     st.header("Module 2 — Sensitivity Analysis")
 
+    # Instruction: delete 2nd sentence
     with st.expander("📘 Instructions", expanded=True):
-        st.write(
-            "Apply different harmonic orders to the whole dataset. "
-            "Observe how **Assymmetricity** and **Polygonality** stabilize as harmonics increase."
-        )
+        st.write("Apply different harmonic orders to the whole dataset.")
 
-    show_images(["Module2_1.png"], "📌 Module 2 instructions (figure)", expanded=EXPANDED, ncols=1)
+    # Renamed "Module 2 instructions figures"
+    show_images(["Module2_1.png"], "📌 Asymmetricity and Polygonality equations", expanded=EXPANDED, ncols=1)
 
     max_h = 40
     default_N = [1, 2, 5, 10, 15, 20]
     chosen_N = st.multiselect(
-        "Select harmonics to evaluate",
+        "Select harmonics order to evaluate",
         options=list(range(1, max_h + 1)),
         default=[n for n in default_N if n <= max_h],
     )
@@ -647,19 +668,16 @@ elif module == "Module 2":
         st.info("Choose at least one harmonic order to evaluate.")
         st.stop()
 
-    current_key = (file_hash, tuple(chosen_N))  # params are fixed
+    current_key = (file_hash, tuple(chosen_N))
 
     if st.session_state.get("module2_key") == current_key:
         sens = st.session_state.get("module2_sens")
-        if sens is not None:
-            st.success("Using saved sensitivity results (no need to rerun).")
     else:
         sens = None
         st.info("Settings changed. Click **Run sensitivity** to compute.")
 
     @st.cache_data(show_spinner=False)
     def _compute_for_N(h: str, df_xy_local: pd.DataFrame, N: int) -> pd.DataFrame:
-        # assignment-style: n_harmonics=no_sum=N
         p = ShapeParams(
             n_harmonics=int(N),
             no_sum=int(N),
@@ -673,7 +691,7 @@ elif module == "Module 2":
         res, _ = compute_shape_indices(df_xy_local, p)
         if res.empty:
             return pd.DataFrame()
-        out = res[["Original_ID", "Assymmetricity", "Polygonality"]].copy()
+        out = res[["Original_ID", "Asymmetricity", "Polygonality"]].copy()
         out["Harmonics"] = int(N)
         return out
 
@@ -711,17 +729,18 @@ elif module == "Module 2":
     sens_sel["Harmonics_cat"] = sens_sel["Harmonics"].astype(str)
     cat_order = [str(n) for n in chosen_N]
 
-    with st.expander("📦 Boxplots (no empty places)", expanded=EXPANDED):
+    # Keep just "Boxplots"
+    with st.expander("📦 Boxplots", expanded=EXPANDED):
         figA = px.box(
             sens_sel,
             x="Harmonics_cat",
-            y="Assymmetricity",
+            y="Asymmetricity",
             points="outliers",
             height=320,
-            title="Assymmetricity vs harmonics",
+            title="Asymmetricity vs harmonics",
         )
         figA.update_xaxes(type="category", categoryorder="array", categoryarray=cat_order, title="Number of harmonics")
-        figA.update_layout(yaxis_title="Assymmetricity")
+        figA.update_layout(yaxis_title="Asymmetricity")
         st.plotly_chart(figA, use_container_width=True)
 
         figP = px.box(
@@ -736,13 +755,14 @@ elif module == "Module 2":
         figP.update_layout(yaxis_title="Polygonality")
         st.plotly_chart(figP, use_container_width=True)
 
-    with st.expander("📉 Optional: stabilization trend (median)", expanded=False):
-        trend = sens.groupby("Harmonics")[["Assymmetricity", "Polygonality"]].median().reset_index()
+    # "Stabilization trend bt medians"
+    with st.expander("📉 Stabilization trend bt medians", expanded=False):
+        trend = sens.groupby("Harmonics")[["Asymmetricity", "Polygonality"]].median().reset_index()
         cA, cP = st.columns(2)
         with cA:
             st.plotly_chart(
-                px.line(trend, x="Harmonics", y="Assymmetricity", markers=True, height=300,
-                        title="Median Assymmetricity vs harmonics"),
+                px.line(trend, x="Harmonics", y="Asymmetricity", markers=True, height=300,
+                        title="Median Asymmetricity vs harmonics"),
                 use_container_width=True,
             )
         with cP:
@@ -754,14 +774,16 @@ elif module == "Module 2":
 
     with st.expander("🧾 Sensitivity table", expanded=EXPANDED):
         st.dataframe(
-            sens_sel[["Particle_ID", "Harmonics", "Assymmetricity", "Polygonality"]].sort_values(["Harmonics", "Particle_ID"]),
+            sens_sel[["Particle_ID", "Harmonics", "Asymmetricity", "Polygonality"]]
+            .sort_values(["Harmonics", "Particle_ID"]),
             use_container_width=True,
         )
 
+    # Renamed download button text
     st.download_button(
-        "⬇️ Download sensitivity CSV",
-        data=sens.to_csv(index=False).encode("utf-8"),
-        file_name="sensitivity_assymmetricity_polygonality.csv",
+        "⬇️ Download sensitivity table",
+        data=sens_sel[["Particle_ID", "Harmonics", "Asymmetricity", "Polygonality"]].to_csv(index=False).encode("utf-8"),
+        file_name="sensitivity_table.csv",
         mime="text/csv",
     )
 
@@ -774,29 +796,29 @@ else:
 
     with st.expander("📘 Instructions", expanded=True):
         st.write(
-            "Run batch analysis, plot distributions (Elongation, Angularity, Roughness), "
-            "and export correlation matrix to find redundant descriptors."
+            "Run, plot distributions (ELongation, Angularity, Roughness, Asymmetricity and Polygonality) "
+            "and correlation matrix to find redundant descriptors"
         )
 
-    show_images(["Module3_1.png", "Module3_2.png", "Module3_3.png", "Module3_4.png"],
-                "📌 Module 3 instructions (figures)", expanded=EXPANDED, ncols=2)
+    show_images(
+        ["Module3_1.png", "Module3_2.png", "Module3_3.png", "Module3_4.png"],
+        "📌 Module 3 instructions (figures)",
+        expanded=EXPANDED,
+        ncols=2,
+    )
 
-    with st.expander("Outline quality check", expanded=False):
-        st.dataframe(points_per_particle(df_xy), use_container_width=True)
-
-    key3 = (file_hash, float(px_per_mm))  # params fixed
+    key3 = (file_hash, float(px_per_mm))
 
     if st.session_state.get("module3_key") == key3:
         results_df = st.session_state.get("module3_results")
         errors_df = st.session_state.get("module3_errors")
-        if results_df is not None:
-            st.success("Using saved Module 3 results (no need to rerun).")
     else:
         results_df = None
         errors_df = None
-        st.info("Settings changed. Click **Run batch shape indices** to compute.")
+        st.info("Settings changed. Click **EFA to whole dataset** to compute.")
 
-    run3 = st.button("Run batch shape indices", type="primary")
+    # Renamed run button
+    run3 = st.button("EFA to whole dataset", type="primary")
     if run3:
         res, err = compute_shape_indices(df_xy, PARAMS_FIXED)
         if res.empty:
@@ -808,7 +830,6 @@ else:
 
         res["Area_mm2"] = res["Area"].apply(lambda v: px2_to_mm2(v, px_per_mm))
         res["Perimeter_mm"] = res["Perimeter"].apply(lambda v: px_to_mm(v, px_per_mm))
-        res["Surface_mm"] = res["Surface"].apply(lambda v: px_to_mm(v, px_per_mm))
 
         st.session_state["module3_results"] = res
         st.session_state["module3_errors"] = err
@@ -820,11 +841,12 @@ else:
     if results_df is None:
         st.stop()
 
-    st.subheader("Results")
+    # Added "Results - all shape indices"
+    st.subheader("Results - all shape indices")
     st.dataframe(results_df, use_container_width=True)
 
     st.download_button(
-        "⬇️ Download full CSV",
+        "⬇️ Download full results (CSV)",
         data=results_df.to_csv(index=False).encode("utf-8"),
         file_name="shape_indices_full.csv",
         mime="text/csv",
@@ -834,26 +856,55 @@ else:
         with st.expander("Errors", expanded=False):
             st.dataframe(errors_df, use_container_width=True)
 
-    with st.expander("📊 Distributions (Elongation / Angularity / Roughness)", expanded=EXPANDED):
-        cols = st.columns(3)
-        plots = [("Elongation", "Elongation"), ("Angularity", "Angularity"), ("Surface_roughness", "Surface_roughness")]
-        for i, (col, title) in enumerate(plots):
-            with cols[i]:
-                if col in results_df.columns:
-                    st.plotly_chart(
-                        px.histogram(results_df, x=col, nbins=30, height=300, title=title),
-                        use_container_width=True,
-                    )
+    # Added table of General statistics
+    with st.expander("📋 General statistics", expanded=EXPANDED):
+        stat_cols = ["Elongation", "Angularity", "Surface_roughness", "Asymmetricity", "Polygonality"]
+        stat_cols = [c for c in stat_cols if c in results_df.columns]
+        stats_tbl = general_statistics_table(results_df, stat_cols)
+        st.dataframe(stats_tbl, use_container_width=True)
 
-    with st.expander("Correlation matrix", expanded=False):
-        numeric_cols = [c for c in results_df.columns if pd.api.types.is_numeric_dtype(results_df[c])]
-        corr = results_df[numeric_cols].corr(method="pearson")
+        st.download_button(
+            "⬇️ Download general statistics (CSV)",
+            data=stats_tbl.to_csv(index=False).encode("utf-8"),
+            file_name="general_statistics.csv",
+            mime="text/csv",
+        )
+
+    # Distributions like Figure_5.ipynb (percentiles legend)
+    with st.expander("📊 Distributions (ELongation, Angularity, Roughness, Asymmetricity, Polygonality)", expanded=EXPANDED):
+        dist_cols = [
+            ("Elongation", "Elongation"),
+            ("Angularity", "Angularity"),
+            ("Surface_roughness", "Surface roughness"),
+            ("Asymmetricity", "Asymmetricity"),
+            ("Polygonality", "Polygonality"),
+        ]
+        for col, xlabel in dist_cols:
+            if col not in results_df.columns:
+                continue
+            st.pyplot(percentile_histogram(results_df, col, xlabel), use_container_width=False)
+
+    # Correlation matrix: warm-ish + values in boxes
+    with st.expander("Correlation matrix", expanded=EXPANDED):
+        corr_cols = ["Elongation", "Angularity", "Surface_roughness", "Asymmetricity", "Polygonality"]
+        corr_cols = [c for c in corr_cols if c in results_df.columns]
+        corr = results_df[corr_cols].apply(pd.to_numeric, errors="coerce").corr(method="pearson")
+
         st.download_button(
             "⬇️ Download correlation matrix (CSV)",
             data=corr.to_csv().encode("utf-8"),
             file_name="correlation_matrix.csv",
             mime="text/csv",
         )
-        fig_corr = px.imshow(corr, aspect="auto", zmin=-1, zmax=1, title="Correlation (Pearson)")
+
+        fig_corr = px.imshow(
+            corr,
+            aspect="auto",
+            zmin=-1,
+            zmax=1,
+            color_continuous_scale="RdBu_r",  # warm for positive, cool for negative
+            text_auto=".2f",
+            title="Correlation (Pearson)",
+        )
         fig_corr.update_xaxes(side="bottom")
         st.plotly_chart(fig_corr, use_container_width=True)
